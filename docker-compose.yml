@@ -1,0 +1,56 @@
+# `docker compose up` starts Postgres, runs migrations + seed data, then the API.
+# Defaults work out of the box; copy .env.example to .env to override them.
+name: slotly
+
+x-database-url: &database-url
+  DATABASE_URL: postgres://${POSTGRES_USER:-slotly}:${POSTGRES_PASSWORD:-slotly}@db:5432/${POSTGRES_DB:-slotly}
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-slotly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-slotly}
+      POSTGRES_DB: ${POSTGRES_DB:-slotly}
+    ports:
+      - "${DB_PORT:-5432}:5432" # exposed so `npm test` can reach it from the host
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h localhost uses TCP, which only opens after the image's init scripts finish.
+      test: ["CMD-SHELL", "pg_isready -h localhost -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot job: apply migrations and seed lab equipment, then exit.
+  migrate:
+    build: .
+    image: slotly-api:local
+    command: ["node", "db/migrate.js", "--seed"]
+    environment:
+      <<: *database-url
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: .
+    image: slotly-api:local
+    environment:
+      <<: *database-url
+      PORT: 3000
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
