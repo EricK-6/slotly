@@ -1,0 +1,33 @@
+#!/bin/bash
+# First-boot script: install Docker, fetch DB credentials, run migrations, start the API.
+set -euo pipefail
+
+dnf install -y docker jq
+systemctl enable --now docker
+
+mkdir -p /opt/slotly
+# AWS RDS CA bundle, so the app can verify the database's TLS certificate.
+curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /opt/slotly/rds-ca.pem
+
+# The password lives only in Secrets Manager; the instance role can read this one secret.
+SECRET=$(aws secretsmanager get-secret-value --region ${region} \
+  --secret-id '${db_secret_arn}' --query SecretString --output text)
+
+umask 077
+cat > /opt/slotly/app.env <<EOF
+PGHOST=${db_host}
+PGPORT=${db_port}
+PGDATABASE=${db_name}
+PGUSER=$(jq -r .username <<< "$SECRET")
+PGPASSWORD=$(jq -r .password <<< "$SECRET")
+PGSSLMODE=verify-full
+NODE_EXTRA_CA_CERTS=/certs/rds-ca.pem
+EOF
+
+RUN_OPTS=(--env-file /opt/slotly/app.env -v /opt/slotly/rds-ca.pem:/certs/rds-ca.pem:ro)
+
+docker pull ${container_image}
+docker run --rm "$${RUN_OPTS[@]}" ${container_image} node db/migrate.js ${seed_flag}
+docker run -d --name slotly --restart unless-stopped -p 80:3000 "$${RUN_OPTS[@]}" \
+  --log-driver awslogs --log-opt awslogs-region=${region} --log-opt awslogs-group=${log_group} \
+  ${container_image}
